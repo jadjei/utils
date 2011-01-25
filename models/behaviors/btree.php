@@ -499,16 +499,26 @@ class BTreeBehavior extends ModelBehavior {
 			return false;
 		}
 
-		$edge = $this->__getMax($Model, $scope, $right, $recursive);
-		$this->__sync($Model, $edge - $node[$left] + 1, '+', 'BETWEEN ' . $node[$left] . ' AND ' . $node[$right]);
-		$this->__sync($Model, $nextNode[$left] - $node[$left], '-', 'BETWEEN ' . $nextNode[$left] . ' AND ' . $nextNode[$right]);
-		$this->__sync($Model, $edge - $node[$left] - ($nextNode[$right] - $nextNode[$left]), '-', '> ' . $edge);
+		$diff = $node[$right] - $node[$left];
+
+		// swap subtree out into free memory and get updated positions
+		$this->__swapout($Model, $node);
+
+		$this->__updateNode($Model, $node);
+		$this->__updateNode($Model, $nextNode);
+		$this->__updateNode($Model, $parentNode);
+
+		// push new neighbours on our new right side to make room and get updated parent
+		$this->__sync($Model, $diff + 1, '+', '> ' . $nextNode[$right]);
+
+		// relocate target to the right of previous right-neighbour
+		$this->__sync($Model, $nextNode[$right] - $node[$left] + $diff, '+', 'BETWEEN ' . $node[$left] . ' AND ' . $node[$right], false, 'both', true);
 
 		if (is_int($number)) {
 			$number--;
 		}
 		if ($number) {
-			$this->moveDown($Model, $id, $number);
+			$this->movedown($Model, $id, $number);
 		}
 		return true;
 	}
@@ -559,10 +569,20 @@ class BTreeBehavior extends ModelBehavior {
 			return false;
 		}
 
-		$edge = $this->__getMax($Model, $scope, $right, $recursive);
-		$this->__sync($Model, $edge - $previousNode[$left] + 1, '+', 'BETWEEN ' . $previousNode[$left] . ' AND ' . $previousNode[$right]);
-		$this->__sync($Model, $node[$left] - $previousNode[$left], '-', 'BETWEEN ' .$node[$left] . ' AND ' . $node[$right]);
-		$this->__sync($Model, $edge - $previousNode[$left] - ($node[$right] - $node[$left]), '-', '> ' . $edge);
+		$diff = $node[$right] - $node[$left];
+
+		// swap subtree out into free memory and get updated positions
+		$this->__swapout($Model, $node);
+
+		$this->__updateNode($Model, $node);
+		$this->__updateNode($Model, $previousNode);
+		$this->__updateNode($Model, $parentNode);
+
+		// push new neighbours on our new right side to make room and get updated parent
+		$this->__sync($Model, $diff + 1, '+', '>= ' . $previousNode[$left]);
+
+		// relocate target to the right of previous right-neighbour
+		$this->__sync($Model, $previousNode[$left] - $node[$left], '+', 'BETWEEN ' . $node[$left] . ' AND ' . $node[$right], false, 'both', true);
 		if (is_int($number)) {
 			$number--;
 		}
@@ -636,7 +656,7 @@ class BTreeBehavior extends ModelBehavior {
 				}
 				$Model->save(array($left => $lft, $right => $rght), array('callbacks' => false));
 			}
-			$nodePage = 0;
+			$nodePage = 1;
 			$count = 0;
 
 			while ($nodes = $Model->find('all', array(
@@ -703,7 +723,7 @@ class BTreeBehavior extends ModelBehavior {
 		if ($nodes) {
 			foreach ($nodes as $node) {
 				$id = $node[$Model->alias][$Model->primaryKey];
-				$this->moveDown($Model, $id, true);
+				$this->movedown($Model, $id, true);
 				if ($node[$Model->alias][$left] != $node[$Model->alias][$right] - 1) {
 					$this->reorder($Model, compact('id', 'field', 'order', 'verify'));
 				}
@@ -968,6 +988,7 @@ class BTreeBehavior extends ModelBehavior {
 				return false;
 			} $parentNode = $parentNode[0];
 
+			// find current rightmost edge of parent tree
 			$edge = $this->__getMax($Model, "{$Model->alias}.{$left} <= " . $parentNode[$left], $right, $recursive, $created);
 
 			if (($Model->id == $parentId)) {
@@ -986,23 +1007,65 @@ class BTreeBehavior extends ModelBehavior {
 			} else {
 				$diff = $node[$right] - $node[$left];
 
-				// increment position values of new family of retargeted subtree
+				// swap subtree out into free memory and get updated positions
+				$this->__swapout($Model, $node);
+				$this->__updateNode($Model, $parentNode);
+
+				// push new neighbours on our new right side to make room and get updated parent
 				$this->__sync($Model, $diff + 1, '+', '>= ' . $parentNode[$right], $created);
+				$this->__updateNode($Model, $parentNode);
+				$this->__updateNode($Model, $node);
 
 				// relocate target node under parent
-				$this->__sync($Model, $parentNode[$right] - $node[$left], '+', 'BETWEEN ' . $node[$left] . ' AND ' . $node[$right], $created);
-
-				// reduce values in former position
-				$nodeTreeMax = $this->__getMax($Model, "{$Model->alias}.{$left} <= " . $node[$left], $right, $recursive, $created);
-				$this->__sync($Model, $diff + 1, '-', 'BETWEEN ' . $node[$right] . ' AND ' . $nodeTreeMax, $created);
+				$this->__sync($Model, $parentNode[$left] - $node[$left] + $diff, '+', 'BETWEEN ' . $node[$left] . ' AND ' . $node[$right], $created);
 			}
 		}
 		$Model->cacheQueries = $cachequeries;
 		return true;
 	}
 
+	function __swapout($Model, $node) {
+		extract($this->settings[$Model->alias]);
+
+		$block = $this->__getPartition($Model);
+		$this->__sync($Model, $block - $node[$left], '+', 'BETWEEN ' . $node[$left] . ' AND ' . $node[$right]);
+
+		// reduce values in former position
+		$diff = $node[$right] - $node[$left];
+		$nodeTreeMax = $this->__getMax($Model, "{$Model->alias}.{$left} <= " . $node[$left], $right, $recursive);
+		$this->__sync($Model, $diff + 1, '-', 'BETWEEN ' . $node[$right] . ' AND ' . $nodeTreeMax);
+	}
+
+	function __updateNode($Model, &$node) {
+		extract($this->settings[$Model->alias]);
+
+		$real_node = $Model->find('first', array(
+						 'conditions' => array(
+							 $Model->primaryKey => $node[$Model->primaryKey]
+						 ),
+						 'fields' => array($left, $right)
+					 )
+		);
+		$node = am($node, array(
+					$left => $real_node[$Model->alias][$left],
+					$right => $real_node[$Model->alias][$right]
+				)
+		);
+	}
+
+	function printDebugTree($Model) {
+		$tree = $Model->find('all');
+		$dtree = "";
+
+		foreach($tree as $node) {
+			$dtree .=
+				$node[$Model->alias][$Model->primaryKey] .' ('.$node[$Model->alias]['parent_id'].') '.
+				'[' . $node[$Model->alias]['lft'] .', '.$node[$Model->alias]['rght'] . "]\n";
+		}
+		debug($dtree);
+	}
 // NEW EDGE/GAP DETECTION
-	function __getPartition($Model, $scope, $recursive = -1, $created = false) {
+	function __getPartition($Model, $scope = '1=1', $recursive = -1, $created = false) {
 		extract($this->settings[$Model->alias]);
 
 		$db =& ConnectionManager::getDataSource($Model->useDbConfig);
@@ -1015,7 +1078,7 @@ class BTreeBehavior extends ModelBehavior {
 			}
 		}
 
-		list($count) = array_values(current($Model->find('first', array('conditions' => "1=1", 'fields' => 'count(' . $Model->primaryKey . ')'))));
+		list($count) = array_values(current($Model->find('first', array('conditions' => "1=1", 'fields' => 'count(' . $Model->alias . '.' . $Model->primaryKey . ')'))));
 
 		$part_lft = $block_size*2;
 		while($part_lft < ($count*2)) $part_lft = $part_lft + ($block_size*2);
@@ -1099,7 +1162,7 @@ class BTreeBehavior extends ModelBehavior {
  * @param array $conditions
  * @param string $field
  */
-	function __sync(&$Model, $shift, $dir = '+', $conditions = array(), $created = false, $field = 'both') {
+	function __sync(&$Model, $shift, $dir = '+', $conditions = array(), $created = false, $field = 'both', $ignore_path = false) {
 		$ModelRecursive = $Model->recursive;
 		$cachequeries = $Model->cacheQueries;
 		extract($this->settings[$Model->alias]);
@@ -1107,7 +1170,7 @@ class BTreeBehavior extends ModelBehavior {
 		$Model->cacheQueries = false;
 
 		if ($field == 'both') {
-			$this->__sync($Model, $shift, $dir, $conditions, $created, $left);
+			$this->__sync($Model, $shift, $dir, $conditions, $created, $left, $ignore_path);
 			$field = $right;
 		}
 		if (is_string($conditions)) {
@@ -1117,6 +1180,7 @@ class BTreeBehavior extends ModelBehavior {
 			$conditions[] = $scope;
 		}
 
+		if(!$ignore_path) {
 		$path = $this->getpath($Model, $Model->id);
 
 		$max = $min = 0;
@@ -1139,6 +1203,7 @@ class BTreeBehavior extends ModelBehavior {
 		}
 		$conditions[] = $Model->escapeField($left) . ' >= ' . $min;
 		$conditions[] = $Model->escapeField($right) . ' <= ' . $max;
+		}
 
 		if ($created) {
 			$conditions['NOT'][$Model->alias . '.' . $Model->primaryKey] = $Model->id;
